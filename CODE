@@ -1,0 +1,690 @@
+/*
+  ESP32 Smart Clock + Timer + RoboEyes (with timed angry/tired) - Debug Version
+*/
+
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_GFX.h>
+#include "time.h"
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <FluxGarage_RoboEyes.h>
+
+// ------------------- DISPLAY CONFIG -------------------
+#define SCREEN_WIDTH  128
+#define SCREEN_HEIGHT  64
+#define OLED_ADDR     0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+RoboEyes<Adafruit_SSD1306> roboEyes(display);
+
+// ------------------- WIFI & NTP -------------------
+const char* ssid     = "enter your wifi"; //change
+const char* password = "wifi pass";   //change
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 6 * 3600;  // UTC+6 Bangladesh
+const int   daylightOffset_sec = 0;
+
+IPAddress local_IP(192, 168, 0, 101);
+IPAddress gateway(192, 168, 0, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress primaryDNS(8, 8, 8, 8);
+IPAddress secondaryDNS(8, 8, 4, 4);
+
+WiFiServer server(80);
+
+// ------------------- PIN DEFINITIONS -------------------
+#define BUTTON_CLOCK_PIN  13  
+#define BUTTON_TIMER_PIN  33
+#define BUTTON_START_PIN  13   
+#define BUZZER_PIN        4
+#define TOUCH_PIN         25
+
+// ------------------- CLOCK MODES -------------------
+enum ClockMode { MODE_CLOCK, MODE_UPTIME, MODE_WEATHER };
+ClockMode currentClockMode = MODE_CLOCK;
+unsigned long modeStartTime = 0;
+const unsigned long MODE_DURATION = 10000;
+
+// ------------------- TIMER MODES -------------------
+enum TimerState { TIMER_NONE, TIMER_45MIN, TIMER_10MIN };
+TimerState currentTimerState = TIMER_NONE;
+
+bool          timerRunning     = false;
+long          timerSeconds     = 0;
+unsigned long timerStartMs     = 0;
+long          timerOriginal    = 0;
+
+// ------------------- BUZZER -------------------
+bool          buzzerActive        = false;
+unsigned long buzzerStart         = 0;
+unsigned long lastBuzzerToggle    = 0;
+bool          buzzerPinState      = LOW;
+const unsigned long BUZZER_TOTAL  = 10000;
+const unsigned long BUZZER_ON     = 500;
+const unsigned long BUZZER_OFF    = 300;
+
+// ------------------- NOTIFICATION -------------------
+String incomingMessage   = "";
+bool   notificationActive = false;
+bool   blinkState         = false;
+unsigned long lastBlinkTime  = 0;
+const unsigned long BLINK_INTERVAL = 500;
+
+// ------------------- DISPLAY TIMER -------------------
+unsigned long lastDisplayUpdate = 0;
+const unsigned long NORMAL_UPDATE_INTERVAL = 1000;
+const unsigned long DISPLAY_INTERVAL       = 200;
+
+// ------------------- WEATHER -------------------
+String apiKey     = "weather api key";  //change
+String city       = "Dhaka";
+String countryCode = "BD";
+float  temperature = 0.0;
+String weatherDesc = "N/A";
+unsigned long lastWeatherFetch = 0;
+const unsigned long WEATHER_FETCH_INTERVAL = 600000;
+
+// ------------------- CLOCK BUTTON DOUBLE CLICK -------------------
+unsigned long lastClockBtnPress   = 0;
+int           clockBtnPressCount  = 0;
+bool          waitingForSecondPress = false;
+const unsigned long DOUBLE_CLICK_WINDOW = 500;
+
+// ------------------- TIMER BUTTON MULTI-CLICK -------------------
+int           timerBtn1Count   = 0;
+unsigned long timerBtn1Last    = 0;
+bool          timerBtn1Prev    = HIGH;
+unsigned long timerBtn1Debounce = 0;
+const unsigned long MULTI_CLICK_WINDOW = 500;
+
+// ------------------- START BUTTON -------------------
+bool          startBtnPrev     = HIGH;
+unsigned long startBtnDebounce = 0;
+const unsigned long DEBOUNCE_MS = 50;
+
+// ------------------- ROBOTIC EYES -------------------
+enum EyeSubMode { EYE_DEFAULT, EYE_ANGRY, EYE_TIRED };
+bool eyesActive = false;
+EyeSubMode currentEyeMode = EYE_DEFAULT;
+unsigned long eyeModeStartTime = 0;
+
+const unsigned long EYE_ANGRY_DURATION = 10000;
+const unsigned long EYE_TIRED_DURATION = 10000;
+
+// ------------------- TOUCH DETECTION -------------------
+#define DEBOUNCE_DELAY       50
+#define DOUBLE_TAP_TIMEOUT   300
+#define LONG_PRESS_DURATION  3000
+
+unsigned long touchStartTime = 0;
+unsigned long lastTouchChange = 0;
+bool lastTouchReading = LOW;
+bool touchPressed = false;
+bool longPressTriggered = false;
+unsigned long lastTapTime = 0;
+int tapCount = 0;
+bool waitingForSecondTap = false;
+
+// =============================================================
+// HELPER FUNCTIONS (unchanged)
+// =============================================================
+void drawCenteredText(int y, const char* text, int textSize) {
+  int16_t x1, y1; uint16_t w, h;
+  display.setTextSize(textSize);
+  display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, y);
+  display.print(text);
+}
+
+void drawClock() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    display.clearDisplay();
+    drawCenteredText(25, "Waiting for", 1);
+    drawCenteredText(40, "NTP...", 1);
+    display.display();
+    return;
+  }
+
+  int hour24 = timeinfo.tm_hour;
+  int minute = timeinfo.tm_min;
+  int second = timeinfo.tm_sec;
+  int hour12 = hour24 % 12;
+  if (hour12 == 0) hour12 = 12;
+
+  char timeStr[10];
+  sprintf(timeStr, "%02d:%02d:%02d", hour12, minute, second);
+
+  int year  = timeinfo.tm_year + 1900;
+  int month = timeinfo.tm_mon + 1;
+  int day   = timeinfo.tm_mday;
+  String dateStr = String(day) + "/" + String(month) + "/" + String(year);
+
+  const char* weekdays[] = {"SUNDAY","MONDAY","TUESDAY","WEDNESDAY","THURSDAY","FRIDAY","SATURDAY"};
+  String dayOfWeek = weekdays[timeinfo.tm_wday];
+
+  display.clearDisplay();
+  drawCenteredText(6, dayOfWeek.c_str(), 1);
+  drawCenteredText(25, timeStr, 2);
+  drawCenteredText(55, dateStr.c_str(), 1);
+  display.display();
+}
+
+void drawUptime() {
+  unsigned long us = millis() / 1000;
+  char buf[32];
+  sprintf(buf, "%02lu:%02lu:%02lu", us/3600, (us%3600)/60, us%60);
+  display.clearDisplay();
+  drawCenteredText(6, "NANO UPTIME", 1);
+  drawCenteredText(30, buf, 2);
+  display.display();
+}
+
+void fetchWeather() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = "http://api.openweathermap.org/data/2.5/weather?q="
+               + city + "," + countryCode + "&appid=" + apiKey + "&units=metric";
+  http.begin(url);
+  if (http.GET() == 200) {
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, http.getString());
+    temperature = doc["main"]["temp"];
+    weatherDesc = doc["weather"][0]["main"].as<String>();
+  }
+  http.end();
+  lastWeatherFetch = millis();
+}
+
+void drawWeather() {
+  display.clearDisplay();
+  drawCenteredText(5, "DHAKA WEATHER", 1);
+  char tempStr[10];
+  dtostrf(temperature, 4, 1, tempStr);
+  String td = String(tempStr) + " C";
+  display.setTextSize(2);
+  int16_t x1,y1; uint16_t w,h;
+  display.getTextBounds(td.c_str(), 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 25);
+  display.print(td);
+  display.setTextSize(1);
+  drawCenteredText(50, weatherDesc.c_str(), 1);
+  display.display();
+}
+
+void drawNotification() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  if (blinkState) {
+    display.setCursor(0, 0);
+    display.println("NEW NOTIFICATION");
+    display.println(incomingMessage);
+  }
+  display.display();
+}
+
+void softAlert() {
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER_PIN, HIGH); delay(20);
+    digitalWrite(BUZZER_PIN, LOW);  delay(50);
+  }
+}
+
+void handleWiFiClient() {
+  WiFiClient client = server.available();
+  if (!client) return;
+  String request = client.readStringUntil('\r');
+
+  int msgIndex = request.indexOf("msg=");
+  if (msgIndex != -1) {
+    String newMsg = request.substring(msgIndex + 4);
+    int endIndex = newMsg.indexOf(" ");
+    if (endIndex != -1) newMsg = newMsg.substring(0, endIndex);
+    newMsg.replace("%20", " ");
+    newMsg.replace("%0A", "\n");
+    incomingMessage   = newMsg;
+    notificationActive = true;
+    blinkState        = false;
+    lastBlinkTime     = millis();
+    softAlert();
+  }
+
+  if (request.indexOf("clear=1") != -1) {
+    incomingMessage    = "";
+    notificationActive = false;
+    lastDisplayUpdate  = 0;
+  }
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-type:text/html");
+  client.println();
+  client.println("OK");
+  client.flush();
+}
+
+void handleClockButton() {
+  static int lastState = HIGH;
+  int state = digitalRead(BUTTON_CLOCK_PIN);
+
+  if (state == LOW && lastState == HIGH) {
+    if (eyesActive) {
+      eyesActive = false;
+      lastDisplayUpdate = 0;
+      Serial.println("Eyes deactivated by D13");
+      delay(DEBOUNCE_MS);
+      lastState = state;
+      return;
+    }
+    unsigned long now = millis();
+    if (!waitingForSecondPress) {
+      waitingForSecondPress = true;
+      lastClockBtnPress    = now;
+      clockBtnPressCount   = 1;
+    } else {
+      if (now - lastClockBtnPress <= DOUBLE_CLICK_WINDOW) {
+        clockBtnPressCount++;
+        if (clockBtnPressCount == 2) {
+          currentClockMode = MODE_WEATHER;
+          modeStartTime    = now;
+          fetchWeather();
+          lastDisplayUpdate = 0;
+          waitingForSecondPress = false;
+          clockBtnPressCount    = 0;
+        }
+      } else {
+        waitingForSecondPress = false;
+        clockBtnPressCount    = 0;
+        if (currentClockMode == MODE_CLOCK)        { currentClockMode = MODE_UPTIME; modeStartTime = now; }
+        else if (currentClockMode == MODE_UPTIME)  { currentClockMode = MODE_CLOCK; }
+        else if (currentClockMode == MODE_WEATHER) { currentClockMode = MODE_CLOCK; }
+      }
+    }
+    delay(DEBOUNCE_MS);
+  }
+  lastState = state;
+
+  if (!eyesActive && waitingForSecondPress && (millis() - lastClockBtnPress > DOUBLE_CLICK_WINDOW)) {
+    waitingForSecondPress = false;
+    clockBtnPressCount    = 0;
+    unsigned long now = millis();
+    if (currentClockMode == MODE_CLOCK)        { currentClockMode = MODE_UPTIME; modeStartTime = now; }
+    else if (currentClockMode == MODE_UPTIME)  { currentClockMode = MODE_CLOCK; }
+    else if (currentClockMode == MODE_WEATHER) { currentClockMode = MODE_CLOCK; }
+  }
+}
+
+void processTimerBtn1Count(int count) {
+  if (count == 1) {
+    currentTimerState = TIMER_45MIN;
+    timerOriginal     = 2700;
+    timerSeconds      = 2700;
+    timerRunning      = false;
+    buzzerActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+  } else if (count == 2) {
+    currentTimerState = TIMER_10MIN;
+    timerOriginal     = 600;
+    timerSeconds      = 600;
+    timerRunning      = false;
+    buzzerActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+  } else {
+    currentTimerState = TIMER_NONE;
+    timerRunning      = false;
+    buzzerActive = false;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+  timerBtn1Count = 0;
+}
+
+String formatTime(long secs) {
+  if (secs < 0) secs = 0;
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%02d:%02d", (int)(secs/60), (int)(secs%60));
+  return String(buf);
+}
+
+long getRemaining() {
+  if (!timerRunning) return timerSeconds;
+  long elapsed = (millis() - timerStartMs) / 1000;
+  long rem = timerSeconds - elapsed;
+  return (rem < 0) ? 0 : rem;
+}
+
+void drawTimer(const char* label, long remaining) {
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print(label);
+
+  display.setTextSize(3);
+  String t = formatTime(remaining);
+  int16_t tx = (SCREEN_WIDTH - (int)t.length() * 18) / 2;
+  display.setCursor(tx, 18);
+  display.print(t);
+
+  display.setTextSize(1);
+  display.setCursor(0, 54);
+  if (timerRunning)        display.print("Running^_^  Btn=Stop");
+  else if (remaining == 0) display.print("DONE!^.^    Btn=Reset");
+  else                     display.print("Paused-_-   Btn=Start");
+
+  display.display();
+}
+
+// =============================================================
+// ROBOTIC EYES FUNCTIONS (simplified)
+// =============================================================
+void setupEyes() {
+  // Set eye appearance
+  roboEyes.setWidth(36, 36);
+  roboEyes.setHeight(25, 25);
+  roboEyes.setBorderradius(8, 8);
+  roboEyes.setSpacebetween(10);
+  roboEyes.setCuriosity(ON);
+  
+  // Start with default settings (will be called once)
+  roboEyes.begin(SCREEN_WIDTH, SCREEN_HEIGHT, 100);
+  roboEyes.setAutoblinker(ON, 3, 2);
+  roboEyes.setIdleMode(ON, 2, 2);
+}
+
+void setEyeMood(EyeSubMode mood) {
+  switch (mood) {
+    case EYE_DEFAULT: roboEyes.setMood(DEFAULT); break;
+    case EYE_ANGRY:   roboEyes.setMood(ANGRY);   break;
+    case EYE_TIRED:   roboEyes.setMood(TIRED);   break;
+  }
+  // No need to call begin again
+}
+
+void activateEyesMode(EyeSubMode mode) {
+  eyesActive = true;
+  currentEyeMode = mode;
+  setEyeMood(mode);
+  if (mode == EYE_ANGRY || mode == EYE_TIRED) {
+    eyeModeStartTime = millis();
+  }
+  // Debug output
+  Serial.print("Activated eyes mode: ");
+  Serial.println(mode == EYE_DEFAULT ? "DEFAULT" : (mode == EYE_ANGRY ? "ANGRY" : "TIRED"));
+}
+
+// ----------------------------------------------------------------------
+//  Process tap count (called after double‑tap timeout)
+// ----------------------------------------------------------------------
+void processTapCount() {
+  if (tapCount == 1) {
+    activateEyesMode(EYE_DEFAULT);
+  } else if (tapCount == 2) {
+    activateEyesMode(EYE_ANGRY);
+  }
+  tapCount = 0;
+  waitingForSecondTap = false;
+}
+
+// ----------------------------------------------------------------------
+//  Touch sensor handler (with debug)
+// ----------------------------------------------------------------------
+void handleTouch() {
+  int reading = digitalRead(TOUCH_PIN);
+  
+  // Optional: print raw reading if changed (for debug)
+  // if (reading != lastTouchReading) Serial.printf("Touch reading: %d\n", reading);
+  
+  // Debounce
+  if (reading != lastTouchReading) {
+    lastTouchChange = millis();
+  }
+  if ((millis() - lastTouchChange) > DEBOUNCE_DELAY) {
+    if (reading != touchPressed) {
+      touchPressed = reading;
+      if (touchPressed == HIGH) {            // Touch started
+        touchStartTime = millis();
+        longPressTriggered = false;
+        Serial.println("Touch start");
+      } else {                               // Touch released
+        unsigned long pressDuration = millis() - touchStartTime;
+        Serial.printf("Touch release, duration: %lu ms\n", pressDuration);
+        
+        if (!longPressTriggered && pressDuration < LONG_PRESS_DURATION) {
+          // Short tap
+          if (!waitingForSecondTap) {
+            tapCount = 1;
+            waitingForSecondTap = true;
+            lastTapTime = millis();
+            Serial.println("First tap detected");
+          } else {
+            if (millis() - lastTapTime <= DOUBLE_TAP_TIMEOUT) {
+              tapCount = 2;
+              waitingForSecondTap = false;
+              Serial.println("Double tap detected");
+              processTapCount();
+            } else {
+              tapCount = 1;
+              waitingForSecondTap = false;
+              Serial.println("Single tap (timeout)");
+              processTapCount();
+            }
+          }
+        }
+      }
+    }
+  }
+  lastTouchReading = reading;
+
+  // Long press detection
+  if (touchPressed == HIGH && !longPressTriggered) {
+    if (millis() - touchStartTime >= LONG_PRESS_DURATION) {
+      longPressTriggered = true;
+      waitingForSecondTap = false;
+      tapCount = 0;
+      Serial.println("Long press detected");
+      activateEyesMode(EYE_TIRED);
+    }
+  }
+
+  // Single tap timeout
+  if (waitingForSecondTap && (millis() - lastTapTime > DOUBLE_TAP_TIMEOUT)) {
+    waitingForSecondTap = false;
+    tapCount = 1;
+    Serial.println("Single tap (timeout)");
+    processTapCount();
+  }
+}
+
+// =============================================================
+// SETUP
+// =============================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting...");
+
+  // OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println(F("SSD1306 failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Pins
+  pinMode(BUTTON_CLOCK_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_TIMER_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_START_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(TOUCH_PIN, INPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Eye library initialization
+  setupEyes();   // This calls begin() once
+  
+  // Quick test of eye moods (to verify library works)
+  Serial.println("Testing eye moods...");
+  activateEyesMode(EYE_DEFAULT);
+  delay(2000);
+  activateEyesMode(EYE_ANGRY);
+  delay(2000);
+  activateEyesMode(EYE_TIRED);
+  delay(2000);
+  // After test, deactivate eyes
+  eyesActive = false;
+  Serial.println("Eye test complete.");
+
+  // Static IP + WiFi
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS))
+    Serial.println("Static IP config failed");
+
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Connecting WiFi");
+  display.display();
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+  server.begin();
+
+  // NTP
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  struct tm timeinfo;
+  int attempts = 0;
+  while (!getLocalTime(&timeinfo) && attempts < 20) { delay(500); attempts++; }
+
+  fetchWeather();
+  drawClock();
+}
+
+// =============================================================
+// LOOP
+// =============================================================
+void loop() {
+  unsigned long now = millis();
+
+  handleWiFiClient();
+  handleTouch();          // Check for touch gestures
+
+  // ── TIMER BUTTON 1 (GPIO 33) – multi-click ────────────────────
+  bool tb1 = digitalRead(BUTTON_TIMER_PIN);
+  if (tb1 == LOW && timerBtn1Prev == HIGH && (now - timerBtn1Debounce) > DEBOUNCE_MS) {
+    timerBtn1Debounce = now;
+    timerBtn1Count++;
+    timerBtn1Last = now;
+  }
+  timerBtn1Prev = tb1;
+
+  if (timerBtn1Count > 0 && (now - timerBtn1Last) > MULTI_CLICK_WINDOW) {
+    processTimerBtn1Count(timerBtn1Count);
+  }
+
+  // ── START/STOP BUTTON (GPIO 14) ───────────────────────────────
+  bool sb = digitalRead(BUTTON_START_PIN);
+  if (sb == LOW && startBtnPrev == HIGH && (now - startBtnDebounce) > DEBOUNCE_MS) {
+    startBtnDebounce = now;
+
+    if (currentTimerState != TIMER_NONE) {
+      long rem = getRemaining();
+      if (rem == 0) {
+        timerRunning = false;
+        timerSeconds = timerOriginal;
+        buzzerActive = false;
+        digitalWrite(BUZZER_PIN, LOW);
+      } else if (timerRunning) {
+        timerSeconds = rem;
+        timerRunning = false;
+      } else {
+        timerStartMs = now;
+        timerRunning = true;
+      }
+    }
+  }
+  startBtnPrev = sb;
+
+  // ── TIMER EXPIRY CHECK ────────────────────────────────────────
+  if (timerRunning) {
+    if (getRemaining() == 0) {
+      timerSeconds = 0;
+      timerRunning = false;
+      if (!buzzerActive) {
+        buzzerActive     = true;
+        buzzerStart      = now;
+        lastBuzzerToggle = now;
+        buzzerPinState   = HIGH;
+        digitalWrite(BUZZER_PIN, HIGH);
+      }
+    }
+  }
+
+  // ── BUZZER PATTERN ────────────────────────────────────────────
+  if (buzzerActive) {
+    if (now - buzzerStart >= BUZZER_TOTAL) {
+      buzzerActive = false;
+      digitalWrite(BUZZER_PIN, LOW);
+    } else {
+      unsigned long elapsed = now - lastBuzzerToggle;
+      if ((buzzerPinState == HIGH && elapsed >= BUZZER_ON) ||
+          (buzzerPinState == LOW  && elapsed >= BUZZER_OFF)) {
+        buzzerPinState = !buzzerPinState;
+        digitalWrite(BUZZER_PIN, buzzerPinState ? HIGH : LOW);
+        lastBuzzerToggle = now;
+      }
+    }
+  }
+
+  // ── WEATHER REFRESH ──────────────────────────────────────────
+  if (WiFi.status() == WL_CONNECTED && (now - lastWeatherFetch > WEATHER_FETCH_INTERVAL))
+    fetchWeather();
+
+  // ── CLOCK BUTTON (handles exit from eyes) ─────────────────────
+  handleClockButton();
+
+  // ── EYE MODE TIMEOUT (angry/tired → default) ─────────────────
+  if (eyesActive) {
+    if (currentEyeMode == EYE_ANGRY && (now - eyeModeStartTime >= EYE_ANGRY_DURATION)) {
+      activateEyesMode(EYE_DEFAULT);
+    } else if (currentEyeMode == EYE_TIRED && (now - eyeModeStartTime >= EYE_TIRED_DURATION)) {
+      activateEyesMode(EYE_DEFAULT);
+    }
+  }
+
+  // ── DISPLAY LOGIC ────────────────────────────────────────────
+  if (eyesActive) {
+    roboEyes.update(); // draw animated eyes
+  } else {
+    // Normal display modes
+    if (currentTimerState != TIMER_NONE) {
+      if (now - lastDisplayUpdate >= DISPLAY_INTERVAL) {
+        lastDisplayUpdate = now;
+        const char* label = (currentTimerState == TIMER_45MIN) ? "   Timer: 45 minute" : "   Timer: 10 minute";
+        drawTimer(label, getRemaining());
+      }
+    } else if (notificationActive) {
+      if (now - lastBlinkTime >= BLINK_INTERVAL) {
+        lastBlinkTime = now;
+        blinkState = !blinkState;
+      }
+      drawNotification();
+    } else {
+      // Auto-return uptime/weather → clock
+      if ((currentClockMode == MODE_UPTIME || currentClockMode == MODE_WEATHER) &&
+          (now - modeStartTime > MODE_DURATION)) {
+        currentClockMode = MODE_CLOCK;
+      }
+
+      if (now - lastDisplayUpdate >= NORMAL_UPDATE_INTERVAL) {
+        lastDisplayUpdate = now;
+        switch (currentClockMode) {
+          case MODE_CLOCK:   drawClock();   break;
+          case MODE_UPTIME:  drawUptime();  break;
+          case MODE_WEATHER: drawWeather(); break;
+        }
+      }
+    }
+  }
+
+  delay(10);
+}
