@@ -88,6 +88,4 @@ Department of Mechanical Engineering
 Ahsanullah University of Science and Technology(AUST)
 
 
-## License
 
-MIT License
