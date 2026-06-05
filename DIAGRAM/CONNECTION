@@ -1,0 +1,19 @@
+OLED Display → Main Board (ESP32)
+● GND (Black Wire) → GND (Ground)
+● VCC (Red Wire) → 3V3
+● SCL (Green Wire) → D22
+● SDA (Orange Wire) → D21
+
+Touch Sensor → Main Board
+● Top Pin / GND (Black Wire) → GND (Ground)
+● Middle Pin / Signal (Blue Wire) → D25
+● Bottom Pin / VCC (Red Wire) → 3V3
+
+Buzzer → Main Board
+● Positive (+) (Orange Wire) → D4
+● Negative (-) (Black Wire) → GND (Ground)
+
+Push Buttons → Main Board
+● Button 1 (Left) Top Pin (Orange Wire) → D27
+● Button 2 (Right) Top Pin (Green Wire) → D14
+● Both Buttons' Bottom Pins (Black Wire) → GND (Ground)
