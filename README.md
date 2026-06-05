@@ -81,7 +81,11 @@ Fetches live weather information using an online API.
 
 
 
-https://github.com/user-attachments/assets/b4ce8ad7-ba5f-4e67-96c3-1bec285ecd8c
+
+
+https://github.com/user-attachments/assets/0d58f34c-2b16-4635-a3ad-ece63d0198ba
+
+
 
 
 
